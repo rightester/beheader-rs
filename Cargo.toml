@@ -18,6 +18,7 @@ image = { version = "0.25", default-features = false, features = ["png", "bmp", 
 zip = { version = "8", default-features = false, features = ["deflate"] }
 byteorder = "1"
 scopeguard = "1"
+base64 = "0.22"
 
 [profile.release]
 opt-level = "z"

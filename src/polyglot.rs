@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -6,6 +7,14 @@ use crate::mp4::{
     build_skip_box, find_png_offset, insert_box_after_ftyp, replace_ftyp_box, update_stco_offsets,
 };
 use crate::utils::{find_subarray, pad_left, read_box_header};
+
+fn build_html_wrapper(html_content: &str) -> Vec<u8> {
+    let b64 = STANDARD.encode(html_content.as_bytes());
+    let wrapper = format!(
+        r#"--><!DOCTYPE html><html><head><meta charset="utf-8"><style>html,body{{margin:0;padding:0;overflow:hidden;height:100%}}</style></head><body><script>(function(){{var b="{b64}";var r=/[A-Za-z0-9+/=]+/g;var m=b.match(r);var s=m?m.join(""):"";var bytes=atob(s);var arr=new Uint8Array(bytes.length);for(var i=0;i<bytes.length;i++)arr[i]=bytes.charCodeAt(i);var blob=new Blob([arr],{{type:"text/html;charset=utf-8"}});var url=URL.createObjectURL(blob);var f=document.createElement("iframe");f.src=url;f.style.cssText="position:fixed;top:0;left:0;width:100%;height:100%;border:0";document.body.appendChild(f);}})();</script></body></html><!--"#
+    );
+    wrapper.into_bytes()
+}
 
 pub struct PolyglotConfig {
     pub png_data: Vec<u8>,
@@ -22,11 +31,7 @@ pub struct PolyglotResult {
 
 pub fn build_polyglot(config: &PolyglotConfig) -> Result<PolyglotResult> {
     let html_bytes = if let Some(ref html) = config.html_content {
-        format!(
-            "--><style>body{{font-size:0}}</style><div style=font-size:initial>{}</div><!--",
-            html
-        )
-        .into_bytes()
+        build_html_wrapper(html)
     } else {
         Vec::new()
     };
