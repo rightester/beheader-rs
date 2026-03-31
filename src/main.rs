@@ -9,12 +9,17 @@ use beheader::{append_zip_to_output, build_polyglot, convert_image_to_png, Polyg
 
 const DEFAULT_TEMP_DIR: &str = ".";
 
+const NOTICE_HELP_MSG: &str = "\
+Notice: 
+    Video conversion produces temporary files in a temp directory.
+    Use --temp-dir to specify a custom location.\
+";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "beheader",
     about = "Polyglot generator for media files",
-    after_help = "Notice: Video conversion produces temporary files (_beheader_0.mp4, _beheader_1.mp4) \
-                  in the temp directory. Use --temp-dir to specify a custom location."
+    after_help = NOTICE_HELP_MSG,
 )]
 struct Args {
     /// Path of resulting polyglot file
