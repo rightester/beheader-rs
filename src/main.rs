@@ -10,8 +10,17 @@ use std::process::Command;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+/// Default temporary directory for intermediate files.
+/// Override this constant for different platforms (e.g., Android internal storage).
+const DEFAULT_TEMP_DIR: &str = ".";
+
 #[derive(Parser, Debug)]
-#[command(name = "beheader", about = "Polyglot generator for media files")]
+#[command(
+    name = "beheader",
+    about = "Polyglot generator for media files",
+    after_help = "Notice: Video conversion produces temporary files (_beheader_0.mp4, _beheader_1.mp4) \
+                  in the temp directory. Use --temp-dir to specify a custom location."
+)]
 struct Args {
     /// Path of resulting polyglot file
     output: PathBuf,
@@ -19,8 +28,13 @@ struct Args {
     /// Path of input image file
     image: PathBuf,
 
-    /// Path of input video (or audio) file
-    video: PathBuf,
+    /// Path of input video (or audio) file, will be encoded by ffmpeg (produces temporary files)
+    #[arg(conflicts_with = "preprocessed_mp4")]
+    video: Option<PathBuf>,
+
+    /// Path of a pre-encoded MP4 file (H.264 video or AAC audio), skips ffmpeg encoding
+    #[arg(long = "preprocessed-mp4", conflicts_with = "video")]
+    preprocessed_mp4: Option<PathBuf>,
 
     /// Path(s) of files to append without parsing
     appendable: Vec<PathBuf>,
@@ -40,6 +54,10 @@ struct Args {
     /// Path to short (<200 byte) file to include near the header
     #[arg(short = 'e', long = "extra")]
     extra: Option<PathBuf>,
+
+    /// Directory for temporary files
+    #[arg(long = "temp-dir", value_name = "DIR")]
+    temp_dir: Option<PathBuf>,
 }
 
 fn find_subarray(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
@@ -177,9 +195,9 @@ fn insert_box_after_ftyp(mp4: &[u8], new_box: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn run_ffmpeg(args: &[&str], tmp_mp4: &Path) -> Result<()> {
-    let exe = Path::new("deps/ffmpeg.exe");
+    let exe = Path::new("ffmpeg.exe");
     if !exe.exists() {
-        bail!("ffmpeg.exe not found at deps/ffmpeg.exe");
+        bail!("ffmpeg.exe not found in current working directory");
     }
     let output = Command::new(exe)
         .args(args)
@@ -194,9 +212,9 @@ fn run_ffmpeg(args: &[&str], tmp_mp4: &Path) -> Result<()> {
 }
 
 fn has_video_stream(video_path: &Path) -> Result<bool> {
-    let exe = Path::new("deps/ffmpeg.exe");
+    let exe = Path::new("ffmpeg.exe");
     if !exe.exists() {
-        bail!("ffmpeg.exe not found at deps/ffmpeg.exe");
+        bail!("ffmpeg.exe not found in current working directory");
     }
     let output = Command::new(exe)
         .arg("-i")
@@ -230,7 +248,10 @@ fn convert_image_to_png(image_path: &Path) -> Result<Vec<u8>> {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let tmp_dir = args.output.parent().unwrap_or(Path::new("."));
+    let tmp_dir = args
+        .temp_dir
+        .as_deref()
+        .unwrap_or_else(|| Path::new(DEFAULT_TEMP_DIR));
     let tmp_mp4_0 = tmp_dir.join("_beheader_0.mp4");
     let tmp_mp4_1 = tmp_dir.join("_beheader_1.mp4");
 
@@ -242,42 +263,54 @@ fn main() -> Result<()> {
     // Convert image to PNG using pure Rust
     let png_data = convert_image_to_png(&args.image)?;
 
-    // Detect video stream and encode
-    let is_video = has_video_stream(&args.video)?;
-    if is_video {
-        run_ffmpeg(
-            &[
-                "-i",
-                args.video.to_str().unwrap(),
-                "-c:v",
-                "libx264",
-                "-strict",
-                "-2",
-                "-preset",
-                "slow",
-                "-pix_fmt",
-                "yuv420p",
-                "-vf",
-                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-                "-f",
-                "mp4",
-                "-y",
-            ],
-            &tmp_mp4_0,
-        )?;
+    // Use pre-encoded MP4, encode with ffmpeg, or create minimal MP4
+    if let Some(preprocessed) = &args.preprocessed_mp4 {
+        fs::copy(preprocessed, &tmp_mp4_0).context("Failed to copy preprocessed MP4")?;
+    } else if let Some(video) = &args.video {
+        let is_video = has_video_stream(video)?;
+        if is_video {
+            run_ffmpeg(
+                &[
+                    "-i",
+                    video.to_str().unwrap(),
+                    "-c:v",
+                    "libx264",
+                    "-strict",
+                    "-2",
+                    "-preset",
+                    "slow",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-vf",
+                    "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                    "-f",
+                    "mp4",
+                    "-y",
+                ],
+                &tmp_mp4_0,
+            )?;
+        } else {
+            run_ffmpeg(
+                &[
+                    "-i",
+                    video.to_str().unwrap(),
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-y",
+                ],
+                &tmp_mp4_0,
+            )?;
+        }
     } else {
-        run_ffmpeg(
-            &[
-                "-i",
-                args.video.to_str().unwrap(),
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-y",
-            ],
-            &tmp_mp4_0,
-        )?;
+        // No video: create minimal MP4 with just ftyp box
+        let minimal_ftyp: &[u8] = &[
+            0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00,
+            0x02, 0x00, 0x69, 0x73, 0x6f, 0x6d, 0x69, 0x73, 0x6f, 0x32, 0x61, 0x76, 0x63, 0x31,
+            0x6d, 0x70, 0x34, 0x31,
+        ];
+        fs::write(&tmp_mp4_0, minimal_ftyp).context("Failed to write minimal MP4")?;
     }
 
     // Build ftyp buffer (288 bytes: 256 ICO header + 32 ftyp box)
