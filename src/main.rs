@@ -13,8 +13,8 @@ const DEFAULT_TEMP_DIR: &str = ".";
 #[command(
     name = "beheader",
     about = "Polyglot generator for media files",
-    after_help = "Notice: Video conversion produces temporary files (_beheader_0.mp4, _beheader_1.mp4) \
-                  in the temp directory. Use --temp-dir to specify a custom location."
+    after_help = "Notice: Video conversion produces temporary files in the temp directory. \
+                  Use --temp-dir to specify a custom location."
 )]
 struct Args {
     /// Path of resulting polyglot file
@@ -101,12 +101,12 @@ fn main() -> Result<()> {
         let mut cmd = Args::command();
         cmd.print_long_help().ok();
         loop {
-            eprintln!("\nEnter arguments (or Ctrl+C to exit):");
+            eprintln!("\nEnter arguments or exit.");
             let mut input = String::new();
             io::stdin().lock().read_line(&mut input)?;
             let line = input.trim();
             if line.is_empty() {
-                continue;
+                std::process::exit(0);
             }
             match parse_args_from_line(line) {
                 Ok(a) => break a,
