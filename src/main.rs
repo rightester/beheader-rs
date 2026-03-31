@@ -1,8 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use beheader::{append_zip_to_output, build_polyglot, convert_image_to_png, PolyglotConfig};
 
@@ -12,8 +13,8 @@ const DEFAULT_TEMP_DIR: &str = ".";
 #[command(
     name = "beheader",
     about = "Polyglot generator for media files",
-    after_help = "Notice: Video must be a pre-encoded MP4 (H.264/AAC). \
-                  Use --temp-dir to specify a custom location for temporary files."
+    after_help = "Notice: Video conversion produces temporary files (_beheader_0.mp4, _beheader_1.mp4) \
+                  in the temp directory. Use --temp-dir to specify a custom location."
 )]
 struct Args {
     /// Path of resulting polyglot file
@@ -22,8 +23,8 @@ struct Args {
     /// Path of input image file
     image: PathBuf,
 
-    /// Path of a pre-encoded MP4 file (H.264 video or AAC audio)
-    mp4: Option<PathBuf>,
+    /// Path of input video (or audio) file, will be encoded by ffmpeg (produces temporary files)
+    video: Option<PathBuf>,
 
     /// Path(s) of files to append without parsing
     #[arg(trailing_var_arg = true)]
@@ -48,6 +49,10 @@ struct Args {
     /// Directory for temporary files
     #[arg(long = "temp-dir", value_name = "DIR")]
     temp_dir: Option<PathBuf>,
+
+    /// Path of a pre-encoded MP4 file (H.264 video or AAC audio), skips ffmpeg encoding
+    #[arg(long = "preprocessed-mp4", conflicts_with = "video")]
+    preprocessed_mp4: Option<PathBuf>,
 }
 
 fn parse_args_from_line(line: &str) -> Result<Args> {
@@ -57,6 +62,51 @@ fn parse_args_from_line(line: &str) -> Result<Args> {
         full_args.push(t.into());
     }
     Args::try_parse_from(full_args).context("Failed to parse arguments")
+}
+
+fn find_ffmpeg() -> Result<PathBuf> {
+    let exe_name = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    let candidates = vec![
+        Path::new(exe_name).to_path_buf(),
+        Path::new("deps").join(exe_name),
+    ];
+    for c in &candidates {
+        if c.exists() {
+            return Ok(c.canonicalize()?);
+        }
+    }
+    bail!(
+        "ffmpeg not found. Please place {} in the current directory or deps/ subdirectory, \
+         or install it to your PATH.",
+        exe_name
+    );
+}
+
+fn run_ffmpeg(ffmpeg: &Path, args: &[&str], output: &Path) -> Result<()> {
+    let output = Command::new(ffmpeg)
+        .args(args)
+        .arg(output)
+        .output()
+        .context("Failed to run ffmpeg")?;
+    if !output.status.success() {
+        eprintln!("ffmpeg stderr: {}", String::from_utf8_lossy(&output.stderr));
+        bail!("ffmpeg failed to encode");
+    }
+    Ok(())
+}
+
+fn has_video_stream(ffmpeg: &Path, video_path: &Path) -> Result<bool> {
+    let output = Command::new(ffmpeg)
+        .arg("-i")
+        .arg(video_path)
+        .output()
+        .context("Failed to run ffmpeg")?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(stderr.contains("Video:"))
 }
 
 fn main() -> Result<()> {
@@ -88,15 +138,57 @@ fn main() -> Result<()> {
         .as_deref()
         .unwrap_or_else(|| Path::new(DEFAULT_TEMP_DIR));
     let tmp_mp4_0 = tmp_dir.join("_beheader_0.mp4");
+    let tmp_mp4_1 = tmp_dir.join("_beheader_1.mp4");
 
     let _cleanup = scopeguard::guard((), |_| {
         let _ = fs::remove_file(&tmp_mp4_0);
+        let _ = fs::remove_file(&tmp_mp4_1);
     });
 
     let png_data = convert_image_to_png(&args.image)?;
 
-    let mp4_data = if let Some(mp4_path) = &args.mp4 {
-        fs::read(mp4_path).context("Failed to read MP4")?
+    if let Some(preprocessed) = &args.preprocessed_mp4 {
+        fs::copy(preprocessed, &tmp_mp4_0).context("Failed to copy preprocessed MP4")?;
+    } else if let Some(video) = &args.video {
+        let ffmpeg = find_ffmpeg()?;
+        let is_video = has_video_stream(&ffmpeg, video)?;
+        if is_video {
+            run_ffmpeg(
+                &ffmpeg,
+                &[
+                    "-i",
+                    video.to_str().unwrap(),
+                    "-c:v",
+                    "libx264",
+                    "-strict",
+                    "-2",
+                    "-preset",
+                    "slow",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-vf",
+                    "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                    "-f",
+                    "mp4",
+                    "-y",
+                ],
+                &tmp_mp4_0,
+            )?;
+        } else {
+            run_ffmpeg(
+                &ffmpeg,
+                &[
+                    "-i",
+                    video.to_str().unwrap(),
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-y",
+                ],
+                &tmp_mp4_0,
+            )?;
+        }
     } else {
         let minimal_ftyp: &[u8] = &[
             0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00,
@@ -104,8 +196,9 @@ fn main() -> Result<()> {
             0x6d, 0x70, 0x34, 0x31,
         ];
         fs::write(&tmp_mp4_0, minimal_ftyp).context("Failed to write minimal MP4")?;
-        fs::read(&tmp_mp4_0).context("Failed to read minimal MP4")?
-    };
+    }
+
+    let mp4_data = fs::read(&tmp_mp4_0).context("Failed to read MP4")?;
 
     let html_content = if let Some(html_path) = &args.html {
         Some(fs::read_to_string(html_path).context("Failed to read HTML")?)
