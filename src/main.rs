@@ -100,10 +100,22 @@ fn main() -> Result<()> {
     let args = if std::env::args_os().len() <= 1 {
         let mut cmd = Args::command();
         cmd.print_long_help().ok();
-        eprintln!("\nEnter arguments (or Ctrl+C to exit):");
-        let mut input = String::new();
-        io::stdin().lock().read_line(&mut input)?;
-        parse_args_from_line(input.trim())?
+        loop {
+            eprintln!("\nEnter arguments (or Ctrl+C to exit):");
+            let mut input = String::new();
+            io::stdin().lock().read_line(&mut input)?;
+            let line = input.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match parse_args_from_line(line) {
+                Ok(a) => break a,
+                Err(e) => {
+                    eprintln!("{e}");
+                    continue;
+                }
+            }
+        }
     } else {
         Args::parse()
     };
