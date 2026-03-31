@@ -1,10 +1,14 @@
 use anyhow::{bail, Context, Result};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use clap::Parser;
+use image::codecs::png::{CompressionType, PngEncoder};
+use image::{ExtendedColorType, ImageEncoder};
 use std::fs;
-use std::io::{Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::io::{Cursor, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use tempfile::TempDir;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 #[derive(Parser, Debug)]
 #[command(name = "beheader", about = "Polyglot generator for media files")]
@@ -38,21 +42,13 @@ struct Args {
     extra: Option<PathBuf>,
 }
 
-fn number_to_4b_le(num: u32) -> [u8; 4] {
-    num.to_le_bytes()
-}
-
-fn number_to_4b_be(num: u32) -> [u8; 4] {
-    num.to_be_bytes()
-}
-
 fn find_subarray(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
     if needle.is_empty() || start >= haystack.len() {
         return None;
     }
     haystack[start..]
         .windows(needle.len())
-        .position(|window| window == needle)
+        .position(|w| w == needle)
         .map(|i| start + i)
 }
 
@@ -64,415 +60,400 @@ fn pad_left(s: &str, target_len: usize, pad_char: char) -> String {
     }
 }
 
-fn run_cmd(cmd: &mut Command, desc: &str) -> Result<std::process::Output> {
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to run {}", desc))?;
-    if !output.status.success() {
-        eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-        bail!("{} failed", desc);
+fn read_box_header(data: &[u8], offset: usize) -> Option<(u64, [u8; 4])> {
+    if offset + 8 > data.len() {
+        return None;
     }
-    Ok(output)
+    let size = Cursor::new(&data[offset..offset + 4])
+        .read_u32::<BigEndian>()
+        .ok()? as u64;
+    let mut box_type = [0u8; 4];
+    box_type.copy_from_slice(&data[offset + 4..offset + 8]);
+    Some((size, box_type))
+}
+
+fn replace_ftyp_box(mp4: &[u8], new_ftyp: &[u8]) -> Result<Vec<u8>> {
+    let (ftyp_size, _) =
+        read_box_header(mp4, 0).with_context(|| "Failed to read ftyp box header")?;
+    let ftyp_end = ftyp_size as usize;
+    let mut result = Vec::with_capacity(mp4.len() - ftyp_end + new_ftyp.len());
+    result.extend_from_slice(new_ftyp);
+    result.extend_from_slice(&mp4[ftyp_end..]);
+    Ok(result)
+}
+
+fn insert_box_after_ftyp(mp4: &[u8], new_box: &[u8]) -> Result<Vec<u8>> {
+    let (ftyp_size, _) =
+        read_box_header(mp4, 0).with_context(|| "Failed to read ftyp box header")?;
+    let ftyp_end = ftyp_size as usize;
+    let mut result = Vec::with_capacity(mp4.len() + new_box.len());
+    result.extend_from_slice(&mp4[..ftyp_end]);
+    result.extend_from_slice(new_box);
+    result.extend_from_slice(&mp4[ftyp_end..]);
+    Ok(result)
+}
+
+fn run_ffmpeg(args: &[&str], tmp_mp4: &Path) -> Result<()> {
+    let exe = Path::new("deps/ffmpeg.exe");
+    if !exe.exists() {
+        bail!("ffmpeg.exe not found at deps/ffmpeg.exe");
+    }
+    let output = Command::new(exe)
+        .args(args)
+        .arg(tmp_mp4)
+        .output()
+        .context("Failed to run ffmpeg")?;
+    if !output.status.success() {
+        eprintln!("ffmpeg stderr: {}", String::from_utf8_lossy(&output.stderr));
+        bail!("ffmpeg failed");
+    }
+    Ok(())
+}
+
+fn has_video_stream(video_path: &Path) -> Result<bool> {
+    let exe = Path::new("deps/ffmpeg.exe");
+    if !exe.exists() {
+        bail!("ffmpeg.exe not found at deps/ffmpeg.exe");
+    }
+    let output = Command::new(exe)
+        .arg("-i")
+        .arg(video_path)
+        .output()
+        .context("Failed to run ffmpeg")?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(stderr.contains("Video:") || stderr.contains("Video:"))
+}
+
+fn convert_image_to_png(image_path: &Path) -> Result<Vec<u8>> {
+    let img = image::open(image_path).context("Failed to open input image")?;
+    let rgba = img.into_rgba8();
+    let mut buf = Vec::new();
+    let encoder = PngEncoder::new_with_quality(
+        &mut buf,
+        CompressionType::Fast,
+        image::codecs::png::FilterType::NoFilter,
+    );
+    encoder
+        .write_image(
+            rgba.as_raw(),
+            rgba.width(),
+            rgba.height(),
+            ExtendedColorType::Rgba8,
+        )
+        .context("Failed to encode PNG")?;
+    Ok(buf)
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let tmp_dir = TempDir::new()?;
-    let tmp_path = tmp_dir.path();
+    let tmp_dir = args.output.parent().unwrap_or(Path::new("."));
+    let tmp_mp4_0 = tmp_dir.join("_beheader_0.mp4");
+    let tmp_mp4_1 = tmp_dir.join("_beheader_1.mp4");
 
-    let tmp_png = tmp_path.join("input.png");
-    let tmp_atom = tmp_path.join("atom.bin");
-    let tmp_mp4_0 = tmp_path.join("0.mp4");
-    let tmp_mp4_1 = tmp_path.join("1.mp4");
-    let tmp_mp4_2 = tmp_path.join("2.mp4");
-    let tmp_dir_zip = tmp_path.join("zipdir");
-    let tmp_zip = tmp_path.join("merged.zip");
+    let _cleanup = scopeguard::guard((), |_| {
+        let _ = fs::remove_file(&tmp_mp4_0);
+        let _ = fs::remove_file(&tmp_mp4_1);
+    });
 
-    // Convert input image to 32 bpp PNG, strip all metadata
-    run_cmd(
-        Command::new("convert")
-            .arg(&args.image)
-            .arg("-define")
-            .arg("png:color-type=6")
-            .arg("-depth")
-            .arg("8")
-            .arg("-alpha")
-            .arg("on")
-            .arg("-strip")
-            .arg(&tmp_png),
-        "convert (ImageMagick)",
-    )?;
+    // Convert image to PNG using pure Rust
+    let png_data = convert_image_to_png(&args.image)?;
 
-    let png_data = fs::read(&tmp_png).context("Failed to read converted PNG")?;
-
-    // Probe video to determine if it has video stream
-    let probe_output = run_cmd(
-        Command::new("ffprobe")
-            .arg("-v")
-            .arg("error")
-            .arg("-select_streams")
-            .arg("v")
-            .arg("-show_entries")
-            .arg("stream=codec_type")
-            .arg("-of")
-            .arg("json")
-            .arg(&args.video),
-        "ffprobe",
-    )?;
-
-    let probe_json: serde_json::Value =
-        serde_json::from_slice(&probe_output.stdout).context("Failed to parse ffprobe output")?;
-    let is_video = probe_json["streams"]
-        .as_array()
-        .map_or(false, |arr| !arr.is_empty());
-
-    // Re-encode input video to MP4 (or M4A for audio-only)
+    // Detect video stream and encode
+    let is_video = has_video_stream(&args.video)?;
     if is_video {
-        run_cmd(
-            Command::new("ffmpeg")
-                .arg("-i")
-                .arg(&args.video)
-                .arg("-c:v")
-                .arg("libx264")
-                .arg("-strict")
-                .arg("-2")
-                .arg("-preset")
-                .arg("slow")
-                .arg("-pix_fmt")
-                .arg("yuv420p")
-                .arg("-vf")
-                .arg("scale=trunc(iw/2)*2:trunc(ih/2)*2")
-                .arg("-f")
-                .arg("mp4")
-                .arg(&tmp_mp4_0),
-            "ffmpeg (video)",
+        run_ffmpeg(
+            &[
+                "-i",
+                args.video.to_str().unwrap(),
+                "-c:v",
+                "libx264",
+                "-strict",
+                "-2",
+                "-preset",
+                "slow",
+                "-pix_fmt",
+                "yuv420p",
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-f",
+                "mp4",
+                "-y",
+            ],
+            &tmp_mp4_0,
         )?;
     } else {
-        run_cmd(
-            Command::new("ffmpeg")
-                .arg("-i")
-                .arg(&args.video)
-                .arg("-c:a")
-                .arg("aac")
-                .arg("-b:a")
-                .arg("192k")
-                .arg(&tmp_mp4_0),
-            "ffmpeg (audio)",
+        run_ffmpeg(
+            &[
+                "-i",
+                args.video.to_str().unwrap(),
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-y",
+            ],
+            &tmp_mp4_0,
         )?;
     }
 
-    // Build ftyp buffer (256 + 32 bytes)
+    // Build ftyp buffer (288 bytes: 256 ICO header + 32 ftyp box)
     let mut ftyp_buffer = vec![0u8; 288];
-
-    // ICO signature (byte 2 = 1)
-    ftyp_buffer[2] = 1;
-
-    // Write "ftyp" atom name
+    ftyp_buffer[2] = 1; // ICO reserved byte
     ftyp_buffer[4..8].copy_from_slice(b"ftyp");
-
-    // Extended atom size marker
-    ftyp_buffer[3] = 32;
-
-    // Standard MP4 header data (second ftyp atom)
+    ftyp_buffer[3] = 32; // Extended size marker
+    ftyp_buffer[12] = 32; // Bit depth
+    ftyp_buffer[14..18].copy_from_slice(&(png_data.len() as u32).to_le_bytes());
     ftyp_buffer[256..288].copy_from_slice(&[
-        0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, // size=32, "ftyp"
-        0x69, 0x73, 0x6f, 0x6d, // "isom"
-        0x00, 0x00, 0x02, 0x00, // version
-        0x69, 0x73, 0x6f, 0x6d, // "isom"
-        0x69, 0x73, 0x6f, 0x32, // "iso2"
-        0x61, 0x76, 0x63, 0x31, // "avc1"
-        0x6d, 0x70, 0x34, 0x31, // "mp41"
+        0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02,
+        0x00, 0x69, 0x73, 0x6f, 0x6d, 0x69, 0x73, 0x6f, 0x32, 0x61, 0x76, 0x63, 0x31, 0x6d, 0x70,
+        0x34, 0x31,
     ]);
 
-    // First image bit depth
-    ftyp_buffer[12] = 32;
+    // Step 1: Replace ftyp atom
+    let mp4_data = fs::read(&tmp_mp4_0).context("Failed to read encoded MP4")?;
+    let mp4_step1 = replace_ftyp_box(&mp4_data, &ftyp_buffer)?;
+    fs::write(&tmp_mp4_1, &mp4_step1)?;
 
-    // Image data size
-    ftyp_buffer[14..18].copy_from_slice(&number_to_4b_le(png_data.len() as u32));
-
-    // Write initial atom file for mp4edit
-    fs::write(&tmp_atom, &ftyp_buffer)?;
-
-    // Replace ftyp atom to measure offsets
-    run_cmd(
-        Command::new("mp4edit")
-            .arg("--replace")
-            .arg(format!("ftyp:{}", tmp_atom.display()))
-            .arg(&tmp_mp4_0)
-            .arg(&tmp_mp4_1),
-        "mp4edit (replace ftyp)",
-    )?;
-
-    // Wrap HTML if provided
+    // HTML wrapper
     let html_string = if let Some(html_path) = &args.html {
-        let html_content = fs::read_to_string(html_path).context("Failed to read HTML file")?;
+        let content = fs::read_to_string(html_path).context("Failed to read HTML")?;
         format!(
             "--><style>body{{font-size:0}}</style><div style=font-size:initial>{}</div><!--",
-            html_content
+            content
         )
     } else {
         String::new()
     };
-
-    // Create skip atom buffer (contains PNG + HTML data)
     let html_bytes = html_string.as_bytes();
-    let mut skip_buffer_data = Vec::with_capacity(png_data.len() + html_bytes.len());
-    skip_buffer_data.extend_from_slice(html_bytes);
-    skip_buffer_data.extend_from_slice(&png_data);
 
-    let skip_buffer_head = {
-        let mut head = [0u8; 8];
-        let total_size = (skip_buffer_data.len() + 8) as u32;
-        head[0..4].copy_from_slice(&number_to_4b_be(total_size));
-        head[4..8].copy_from_slice(b"skip");
-        head
+    // Build skip atom
+    let mut skip_payload = Vec::with_capacity(html_bytes.len() + png_data.len());
+    skip_payload.extend_from_slice(html_bytes);
+    skip_payload.extend_from_slice(&png_data);
+
+    let skip_total = (skip_payload.len() + 8) as u32;
+    let mut skip_buffer = Vec::with_capacity(skip_payload.len() + 8);
+    skip_buffer.write_u32::<BigEndian>(skip_total)?;
+    skip_buffer.extend_from_slice(b"skip");
+    skip_buffer.extend_from_slice(&skip_payload);
+
+    // Step 2: Insert skip atom after ftyp
+    let mp4_step2 = insert_box_after_ftyp(&mp4_step1, &skip_buffer)?;
+
+    // Find PNG offset
+    let skip_head = {
+        let mut h = [0u8; 8];
+        h[0..4].copy_from_slice(&skip_total.to_be_bytes());
+        h[4..8].copy_from_slice(b"skip");
+        h
     };
+    let png_offset = find_subarray(&mp4_step2, &skip_head, 0)
+        .map(|p| p + 8 + html_bytes.len())
+        .context("Failed to find PNG offset")?;
 
-    let mut skip_buffer = Vec::with_capacity(skip_buffer_data.len() + 8);
-    skip_buffer.extend_from_slice(&skip_buffer_head);
-    skip_buffer.extend_from_slice(&skip_buffer_data);
-
-    // Insert skip atom
-    fs::write(&tmp_atom, &skip_buffer)?;
-    run_cmd(
-        Command::new("mp4edit")
-            .arg("--insert")
-            .arg(format!("skip:{}", tmp_atom.display()))
-            .arg(&tmp_mp4_1)
-            .arg(&tmp_mp4_2),
-        "mp4edit (insert skip)",
-    )?;
-
-    // Find PNG offset in MP4 file
-    let mp4_data = fs::read(&tmp_mp4_2).context("Failed to read MP4 file")?;
-    let png_offset = find_subarray(&mp4_data, &skip_buffer_head, 0)
-        .map(|pos| pos + 8 + html_bytes.len())
-        .context("Failed to find PNG offset in MP4")?;
-
-    // Set PNG data offset for first ICO image
-    ftyp_buffer[18..22].copy_from_slice(&number_to_4b_le(png_offset as u32));
-
-    // Set ICO image count to 1 and clear atom name
-    ftyp_buffer[4..8].copy_from_slice(&[1, 0, 0, 0]);
-
-    // Write supported brands
+    // Update ftyp buffer with final values
+    ftyp_buffer[18..22].copy_from_slice(&(png_offset as u32).to_le_bytes());
+    ftyp_buffer[4..8].copy_from_slice(&[1, 0, 0, 0]); // Image count = 1, clear atom name
     ftyp_buffer[240..256].copy_from_slice(b"isomiso2avc1mp41");
 
-    // Track free space start
-    let mut atom_free_addr = 22;
-
-    // Add extra data if provided
+    // Extra data
     let extra_data = if let Some(extra_path) = &args.extra {
         fs::read(extra_path).context("Failed to read extra file")?
     } else {
         Vec::new()
     };
-
+    let mut atom_free_addr = 22;
     ftyp_buffer[atom_free_addr..atom_free_addr + extra_data.len()].copy_from_slice(&extra_data);
     atom_free_addr += extra_data.len();
-
-    // Create HTML comment
-    let comment = b"<!--";
-    ftyp_buffer[atom_free_addr..atom_free_addr + 4].copy_from_slice(comment);
+    ftyp_buffer[atom_free_addr..atom_free_addr + 4].copy_from_slice(b"<!--");
     atom_free_addr += 4;
 
-    // Handle PDF if provided
+    // PDF first pass
     let pdf_data = if let Some(pdf_path) = &args.pdf {
-        Some(fs::read(pdf_path).context("Failed to read PDF file")?)
+        Some(fs::read(pdf_path).context("Failed to read PDF")?)
     } else {
         None
     };
+    let mp4_size = mp4_step2.len();
 
-    let mp4_size = fs::metadata(&tmp_mp4_2)?.len() as usize;
-
-    if let Some(ref pdf_buffer) = pdf_data {
-        // First PDF pass - create early header and wrap MP4 in PDF object
+    if let Some(ref pdf_buf) = pdf_data {
         ftyp_buffer[atom_free_addr] = 0x0A;
-        ftyp_buffer[atom_free_addr + 1..atom_free_addr + 10].copy_from_slice(&pdf_buffer[0..9]);
+        ftyp_buffer[atom_free_addr + 1..atom_free_addr + 10]
+            .copy_from_slice(&pdf_buf[0..9.min(pdf_buf.len())]);
         atom_free_addr += 10;
 
-        // Create PDF object string with dynamic length adjustment
         let mut offset = 30 + mp4_size.to_string().len();
         let obj_string;
-
         loop {
             offset -= 1;
-            let length = mp4_size - atom_free_addr - extra_data.len() - offset;
-            let candidate = format!("\n1 0 obj\n<</Length {}>>\nstream\n", length);
+            let len = mp4_size - atom_free_addr - extra_data.len() - offset;
+            let candidate = format!("\n1 0 obj\n<</Length {}>>\nstream\n", len);
             if offset == candidate.len() {
                 obj_string = candidate;
                 break;
             }
         }
-
         let obj_bytes = obj_string.as_bytes();
-        let end_addr = atom_free_addr + extra_data.len() + obj_bytes.len();
-        if end_addr > ftyp_buffer.len() {
-            bail!("PDF object string exceeds ftyp buffer size");
+        let end = atom_free_addr + extra_data.len() + obj_bytes.len();
+        if end > ftyp_buffer.len() {
+            bail!("PDF object exceeds ftyp buffer");
         }
-        ftyp_buffer[atom_free_addr + extra_data.len()..end_addr].copy_from_slice(obj_bytes);
+        ftyp_buffer[atom_free_addr + extra_data.len()..end].copy_from_slice(obj_bytes);
     }
 
-    // Write final ftyp atom
-    fs::write(&tmp_atom, &ftyp_buffer)?;
+    // Step 3: Final ftyp replacement
+    let mp4_final = replace_ftyp_box(&mp4_step2, &ftyp_buffer)?;
 
-    // Replace ftyp and write output file
-    run_cmd(
-        Command::new("mp4edit")
-            .arg("--replace")
-            .arg(format!("ftyp:{}", tmp_atom.display()))
-            .arg(&tmp_mp4_2)
-            .arg(&args.output),
-        "mp4edit (final replace)",
-    )?;
+    // Write output
+    let mut out = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&args.output)?;
+    out.write_all(&mp4_final)?;
 
-    // Fix the bithack - split off extra ftyp atom
-    {
-        let mut file = fs::OpenOptions::new().write(true).open(&args.output)?;
-        file.seek(SeekFrom::Start(3))?;
-        file.write_all(&[0])?;
-    }
+    // Bithack fix: zero byte 3 to split ftyp
+    out.seek(SeekFrom::Start(3))?;
+    out.write_all(&[0])?;
+    drop(out);
 
-    // Second PDF pass - close object and append PDF data
-    if let Some(pdf_buffer) = pdf_data {
-        let object_terminator = b"\nendstream\nendobj\n";
-        let mut final_pdf = vec![0u8; pdf_buffer.len() + object_terminator.len() + 10];
-        final_pdf[0..object_terminator.len()].copy_from_slice(object_terminator);
-        final_pdf[object_terminator.len()..object_terminator.len() + pdf_buffer.len()]
-            .copy_from_slice(&pdf_buffer);
+    // PDF second pass
+    if let Some(pdf_buf) = pdf_data {
+        let term = b"\nendstream\nendobj\n";
+        let mut final_pdf = vec![0u8; pdf_buf.len() + term.len() + 10];
+        final_pdf[0..term.len()].copy_from_slice(term);
+        final_pdf[term.len()..term.len() + pdf_buf.len()].copy_from_slice(&pdf_buf);
 
-        // Find cross-reference table
-        let xref_start =
-            find_subarray(&final_pdf, b"\nxref", 0).context("Failed to find xref table")? + 1;
-        let offset_start = find_subarray(&final_pdf, b"\n0000000000", xref_start)
-            .context("Failed to find offset in xref")?
-            + 1;
-        let startxref_start = find_subarray(&final_pdf, b"\nstartxref", xref_start)
+        let xref_pos = find_subarray(&final_pdf, b"\nxref", 0).context("Failed to find xref")? + 1;
+        let sxref_pos = find_subarray(&final_pdf, b"\nstartxref", xref_pos)
             .context("Failed to find startxref")?
             + 1;
-        let startxref_end = final_pdf[startxref_start + 11..]
+
+        // Parse xref: find the "0 383" line after "xref"
+        // xref_pos points to 'x' in "xref"
+        let mut scan = xref_pos;
+        // Skip "xref"
+        scan += 4;
+        // Skip line ending
+        if final_pdf.get(scan) == Some(&b'\r') {
+            scan += 1;
+        }
+        if final_pdf.get(scan) == Some(&b'\n') {
+            scan += 1;
+        }
+        // Now at "0 383"
+        let line_end = final_pdf[scan..]
             .iter()
-            .position(|&b| b == 0x0A)
-            .map(|p| startxref_start + 11 + p)
-            .context("Failed to find end of startxref")?;
-
-        let output_size = fs::metadata(&args.output)?.len() as usize;
-
-        // Parse xref header to get entry count
-        let xref_header = String::from_utf8_lossy(&final_pdf[xref_start..offset_start]);
-        let count: usize = xref_header
-            .trim()
-            .split_whitespace()
-            .last()
+            .position(|&b| b == b'\n' || b == b'\r')
+            .unwrap_or(20);
+        let hdr = String::from_utf8_lossy(&final_pdf[scan..scan + line_end]);
+        let parts: Vec<&str> = hdr.trim().split_whitespace().collect();
+        let count: usize = parts
+            .get(1)
             .and_then(|s| s.parse().ok())
-            .context("Failed to parse xref entry count")?;
+            .context("Failed to parse xref count")?;
 
-        // Update all offsets
-        let mut curr = offset_start;
+        // First entry line starts after this header line
+        let mut curr = scan + line_end;
+        if final_pdf.get(curr) == Some(&b'\r') {
+            curr += 1;
+        }
+        if final_pdf.get(curr) == Some(&b'\n') {
+            curr += 1;
+        }
+
+        let out_size = fs::metadata(&args.output)?.len() as usize;
+
+        // Update all offset entries
         for _ in 0..count {
-            let offset_str = String::from_utf8_lossy(&final_pdf[curr..curr + 10]);
-            if let Ok(offset) = offset_str.trim().parse::<usize>() {
-                let new_offset = offset + output_size + object_terminator.len();
-                let padded = pad_left(&new_offset.to_string(), 10, '0');
-                final_pdf[curr..curr + 10].copy_from_slice(padded.as_bytes());
+            if curr + 20 > final_pdf.len() {
+                break;
             }
-            curr = final_pdf[curr + 1..]
+            let s = String::from_utf8_lossy(&final_pdf[curr..curr + 10]);
+            if let Ok(off) = s.trim().parse::<usize>() {
+                let new = pad_left(&(off + out_size + term.len()).to_string(), 10, '0');
+                final_pdf[curr..curr + 10].copy_from_slice(new.as_bytes());
+            }
+            // Skip to next line (each entry is 20 bytes: 10 offset + space + 5 gen + space + 1 flag)
+            curr = final_pdf[curr..]
                 .iter()
-                .position(|&b| b == 0x0A)
-                .map(|p| curr + 1 + p)
-                .unwrap_or(curr + 1);
+                .position(|&b| b == b'\n')
+                .map(|p| curr + p + 1)
+                .unwrap_or(curr + 20);
         }
 
         // Adjust startxref offset
-        let startxref_str =
-            String::from_utf8_lossy(&final_pdf[startxref_start + 10..startxref_end]);
-        if let Ok(startxref) = startxref_str.trim().parse::<usize>() {
-            let new_startxref = (startxref + output_size + object_terminator.len()).to_string();
-            let new_bytes = new_startxref.as_bytes();
-            final_pdf[startxref_start + 10..startxref_start + 10 + new_bytes.len()]
-                .copy_from_slice(new_bytes);
-
-            // Replace %%EOF just in case
-            let eof_marker = b"\n%%EOF\n";
-            let eof_pos = startxref_start + 10 + new_bytes.len();
-            if eof_pos + eof_marker.len() <= final_pdf.len() {
-                final_pdf[eof_pos..eof_pos + eof_marker.len()].copy_from_slice(eof_marker);
+        let sxref_val_start = sxref_pos + 11;
+        let sxref_val_end = final_pdf[sxref_val_start..]
+            .iter()
+            .position(|&b| b == b'\n' || b == b'\r')
+            .map(|p| sxref_val_start + p)
+            .unwrap_or(sxref_val_start + 10);
+        let sxref_s = String::from_utf8_lossy(&final_pdf[sxref_val_start..sxref_val_end]);
+        if let Ok(sxref) = sxref_s.trim().parse::<usize>() {
+            let new_sxref = (sxref + out_size + term.len()).to_string();
+            let nb = new_sxref.as_bytes();
+            final_pdf[sxref_val_start..sxref_val_start + nb.len()].copy_from_slice(nb);
+            let eof_pos = sxref_val_start + nb.len();
+            if eof_pos + 7 <= final_pdf.len() {
+                final_pdf[eof_pos..eof_pos + 7].copy_from_slice(b"\n%%EOF\n");
             }
-
-            // Zero out remaining data
-            let clear_start = startxref_start + new_bytes.len() + 17;
-            for byte in final_pdf.iter_mut().skip(clear_start) {
-                *byte = 0;
+            for b in final_pdf.iter_mut().skip(sxref_val_start + nb.len() + 17) {
+                *b = 0;
             }
         }
 
-        // Append to output file
-        let mut output_file = fs::OpenOptions::new()
-            .write(true)
-            .append(true)
-            .open(&args.output)?;
-        output_file.write_all(&final_pdf)?;
+        let mut out = fs::OpenOptions::new().append(true).open(&args.output)?;
+        out.write_all(&final_pdf)?;
     }
 
-    // Append any appendable files
+    // Append appendables
     for path in &args.appendable {
         if !path.exists() {
-            eprintln!("Warning: appendable file not found: {}", path.display());
+            eprintln!("Warning: {} not found, skipping", path.display());
             continue;
         }
-        let mut output_file = fs::OpenOptions::new()
-            .write(true)
-            .append(true)
-            .open(&args.output)?;
         let data = fs::read(path)?;
-        output_file.write_all(&data)?;
+        let mut out = fs::OpenOptions::new().append(true).open(&args.output)?;
+        out.write_all(&data)?;
     }
 
-    // Handle ZIP archives
+    // Handle ZIPs with pure Rust
     if !args.zip.is_empty() {
-        fs::create_dir_all(&tmp_dir_zip)?;
+        let mut merged = Cursor::new(Vec::new());
+        let mut zw = ZipWriter::new(&mut merged);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
-        // Extract all ZIP archives
-        for zip_path in &args.zip {
-            run_cmd(
-                Command::new("unzip")
-                    .arg("-d")
-                    .arg(&tmp_dir_zip)
-                    .arg(zip_path),
-                &format!("unzip {}", zip_path.display()),
-            )?;
+        let mut seen = std::collections::HashSet::new();
+        for zp in &args.zip {
+            let f = fs::File::open(zp).with_context(|| format!("Cannot open {}", zp.display()))?;
+            let mut za = ZipArchive::new(f)?;
+            for i in 0..za.len() {
+                let mut entry = za.by_index(i)?;
+                let name = entry.name().to_string();
+                if seen.contains(&name) {
+                    continue;
+                }
+                seen.insert(name.clone());
+                zw.start_file(&name, opts)?;
+                std::io::copy(&mut entry, &mut zw)?;
+            }
         }
+        zw.finish()?;
+        let zip_bytes = merged.into_inner();
 
-        // Create merged ZIP
-        run_cmd(
-            Command::new("zip")
-                .arg("-r9")
-                .arg(&tmp_zip)
-                .arg(".")
-                .current_dir(&tmp_dir_zip),
-            "zip (merge)",
-        )?;
+        let mut out = fs::OpenOptions::new().append(true).open(&args.output)?;
+        out.write_all(&zip_bytes)?;
 
-        // Append ZIP to output
-        {
-            let mut output_file = fs::OpenOptions::new()
-                .write(true)
-                .append(true)
-                .open(&args.output)?;
-            let zip_data = fs::read(&tmp_zip)?;
-            output_file.write_all(&zip_data)?;
+        // Run zip -A for offset fix (only external dep left)
+        let exe = Path::new("deps/ffmpeg.exe");
+        let zip_exe = exe.parent().unwrap().join("zip.exe");
+        if zip_exe.exists() {
+            let _ = Command::new(&zip_exe).arg("-A").arg(&args.output).output();
         }
-
-        // Fix self-extracting archive offset
-        run_cmd(
-            Command::new("zip").arg("-A").arg(&args.output),
-            "zip -A (offset fix)",
-        )?;
     }
 
-    // TempDir will be automatically cleaned up when dropped
-
-    println!("Polyglot file created: {}", args.output.display());
+    println!("Polyglot created: {}", args.output.display());
     Ok(())
 }
