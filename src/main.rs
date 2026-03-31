@@ -72,6 +72,89 @@ fn read_box_header(data: &[u8], offset: usize) -> Option<(u64, [u8; 4])> {
     Some((size, box_type))
 }
 
+fn find_boxes_recursive(
+    data: &[u8],
+    pos: usize,
+    end: usize,
+    target: &[u8; 4],
+    results: &mut Vec<(u64, usize)>,
+) {
+    let mut p = pos;
+    while p + 8 <= end {
+        if let Some((size, box_type)) = read_box_header(data, p) {
+            if size < 8 || p + size as usize > end {
+                break;
+            }
+            if box_type == *target {
+                results.push((size, p));
+            } else if box_type != *b"mdat" && box_type != *b"skip" && size > 8 {
+                // Recurse into container boxes (skip mdat and skip which contain raw data)
+                find_boxes_recursive(data, p + 8, p + size as usize, target, results);
+            }
+            p += size as usize;
+        } else {
+            break;
+        }
+    }
+}
+
+fn find_all_boxes(data: &[u8], target: &[u8; 4]) -> Vec<(u64, usize)> {
+    let mut results = Vec::new();
+    find_boxes_recursive(data, 0, data.len(), target, &mut results);
+    results
+}
+
+fn update_stco_offsets(mp4: &mut [u8], delta: u64) {
+    let stco_boxes = find_all_boxes(mp4, b"stco");
+    for (_size, pos) in stco_boxes {
+        let pos = pos as usize;
+        if pos + 16 > mp4.len() {
+            continue;
+        }
+        let entry_count = Cursor::new(&mp4[pos + 12..pos + 16])
+            .read_u32::<BigEndian>()
+            .unwrap_or(0) as usize;
+        let mut curr = pos + 16;
+        for _ in 0..entry_count {
+            if curr + 4 > mp4.len() {
+                break;
+            }
+            let offset = Cursor::new(&mp4[curr..curr + 4])
+                .read_u32::<BigEndian>()
+                .unwrap_or(0) as u64;
+            let new_offset = offset + delta;
+            (&mut mp4[curr..curr + 4])
+                .write_u32::<BigEndian>(new_offset as u32)
+                .ok();
+            curr += 4;
+        }
+    }
+    let co64_boxes = find_all_boxes(mp4, b"co64");
+    for (_size, pos) in co64_boxes {
+        let pos = pos as usize;
+        if pos + 16 > mp4.len() {
+            continue;
+        }
+        let entry_count = Cursor::new(&mp4[pos + 12..pos + 16])
+            .read_u32::<BigEndian>()
+            .unwrap_or(0) as usize;
+        let mut curr = pos + 16;
+        for _ in 0..entry_count {
+            if curr + 8 > mp4.len() {
+                break;
+            }
+            let offset = Cursor::new(&mp4[curr..curr + 8])
+                .read_u64::<BigEndian>()
+                .unwrap_or(0);
+            let new_offset = offset + delta;
+            (&mut mp4[curr..curr + 8])
+                .write_u64::<BigEndian>(new_offset)
+                .ok();
+            curr += 8;
+        }
+    }
+}
+
 fn replace_ftyp_box(mp4: &[u8], new_ftyp: &[u8]) -> Result<Vec<u8>> {
     let (ftyp_size, _) =
         read_box_header(mp4, 0).with_context(|| "Failed to read ftyp box header")?;
@@ -121,7 +204,7 @@ fn has_video_stream(video_path: &Path) -> Result<bool> {
         .output()
         .context("Failed to run ffmpeg")?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    Ok(stderr.contains("Video:") || stderr.contains("Video:"))
+    Ok(stderr.contains("Video:"))
 }
 
 fn convert_image_to_png(image_path: &Path) -> Result<Vec<u8>> {
@@ -212,7 +295,13 @@ fn main() -> Result<()> {
 
     // Step 1: Replace ftyp atom
     let mp4_data = fs::read(&tmp_mp4_0).context("Failed to read encoded MP4")?;
-    let mp4_step1 = replace_ftyp_box(&mp4_data, &ftyp_buffer)?;
+    let original_ftyp_size = read_box_header(&mp4_data, 0)
+        .map(|(s, _)| s as usize)
+        .context("Failed to read original ftyp size")?;
+    let new_ftyp_size = ftyp_buffer.len();
+    let ftyp_delta = new_ftyp_size as u64 - original_ftyp_size as u64;
+    let mut mp4_step1 = replace_ftyp_box(&mp4_data, &ftyp_buffer)?;
+    update_stco_offsets(&mut mp4_step1, ftyp_delta);
     fs::write(&tmp_mp4_1, &mp4_step1)?;
 
     // HTML wrapper
@@ -239,7 +328,9 @@ fn main() -> Result<()> {
     skip_buffer.extend_from_slice(&skip_payload);
 
     // Step 2: Insert skip atom after ftyp
-    let mp4_step2 = insert_box_after_ftyp(&mp4_step1, &skip_buffer)?;
+    let skip_delta = skip_buffer.len() as u64;
+    let mut mp4_step2 = insert_box_after_ftyp(&mp4_step1, &skip_buffer)?;
+    update_stco_offsets(&mut mp4_step2, skip_delta);
 
     // Find PNG offset
     let skip_head = {
