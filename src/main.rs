@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use std::fs;
-use std::io::Write;
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -87,8 +87,26 @@ fn has_video_stream(video_path: &Path) -> Result<bool> {
     Ok(stderr.contains("Video:"))
 }
 
+fn parse_args_from_line(line: &str) -> Result<Args> {
+    let tokens = shell_words::split(line).context("Failed to parse input line")?;
+    let mut full_args = vec![std::env::args_os().next().unwrap_or_default()];
+    for t in tokens {
+        full_args.push(t.into());
+    }
+    Args::try_parse_from(full_args).context("Failed to parse arguments")
+}
+
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = if std::env::args_os().len() <= 1 {
+        let mut cmd = Args::command();
+        cmd.print_long_help().ok();
+        eprintln!("\nEnter arguments (or Ctrl+C to exit):");
+        let mut input = String::new();
+        io::stdin().lock().read_line(&mut input)?;
+        parse_args_from_line(input.trim())?
+    } else {
+        Args::parse()
+    };
 
     let tmp_dir = args
         .temp_dir

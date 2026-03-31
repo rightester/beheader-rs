@@ -19,6 +19,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 byteorder = "1"
 scopeguard = "1"
 base64 = "0.22"
+shell-words = "1"
 
 [profile.release]
 opt-level = "z"
