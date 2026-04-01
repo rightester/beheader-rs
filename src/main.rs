@@ -75,19 +75,25 @@ fn find_ffmpeg() -> Result<PathBuf> {
     } else {
         "ffmpeg"
     };
-    let candidates = vec![
-        Path::new(exe_name).to_path_buf(),
-        Path::new("deps").join(exe_name),
-    ];
+    let candidates = vec![Path::new(exe_name).to_path_buf()];
     for c in &candidates {
         if c.exists() {
             return Ok(c.canonicalize()?);
         }
     }
+    let download_links = if cfg!(windows) {
+        "https://www.gyan.dev/ffmpeg/builds/ or https://github.com/BtbN/FFmpeg-Builds/releases"
+    } else if cfg!(target_os = "macos") {
+        "https://evermeet.cx/ffmpeg/ or via Homebrew: brew install ffmpeg"
+    } else {
+        "https://johnvansickle.com/ffmpeg/ or via your package manager (apt install ffmpeg, etc.)"
+    };
     bail!(
-        "ffmpeg not found. Please place {} in the current directory or deps/ subdirectory, \
-         or install it to your PATH.",
-        exe_name
+        "ffmpeg not found. Please place {} in the current directory \
+         or install it to your PATH.\n\
+         Download ffmpeg: {}",
+        exe_name,
+        download_links
     );
 }
 
