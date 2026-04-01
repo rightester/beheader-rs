@@ -1,1 +1,8 @@
 /target
+*.zip
+*.exe
+_temp*
+.idea/
+.vscode/
+*.wasm
+pkg-*/

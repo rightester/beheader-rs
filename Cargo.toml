@@ -2,6 +2,12 @@
 name = "beheader-rs"
 version = "0.3.2"
 edition = "2021"
+description = "A polyglot generator for media files - Rust port of beheader"
+license = "GPL-3.0"
+repository = "https://github.com/rightester/beheader-rs"
+readme = "README.md"
+keywords = ["polyglot", "media", "png", "mp4", "file-format"]
+categories = ["command-line-utilities", "multimedia", "encoding"]
 
 [lib]
 name = "beheader"
