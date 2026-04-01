@@ -10,10 +10,10 @@ A polyglot generator for media files — produce a single file that behaves as a
 
 - **Self-contained binary**: All external CLI tool logic has been integrated into the binary itself. No extra executable dependencies required, except `ffmpeg.exe` for video/audio encoding.
 - **Decoupled architecture**: Split into a `bin` target (the CLI executable) and a `lib` target (reusable library crate), allowing programmatic use of the polyglot generation logic.
-- **Automatic ffmpeg discovery**: The CLI automatically searches for `ffmpeg.exe` in the current directory and system `PATH`.
-- **`--preprocessed-mp4`**: Accept a pre-encoded MP4 file as input, completely bypassing the need for `ffmpeg.exe`.
+- **About ffmpeg executable**: The CLI tool will try to find and use ffmpeg on demand in opened-up environment like Desktop, for user's convenience.
+- **`--preprocessed-mp4`**: Accept a pre-encoded MP4 file as input, completely bypassing the need for `ffmpeg.exe` if needed.
 - **`--temp-dir`**: Specify a custom directory for temporary files produced during video processing.
-- **WASM/WASI support**: When used as a WASM/WASI module or as a library, `ffmpeg.exe` cannot be invoked — only the `--preprocessed-mp4` parameter is available for video input.
+- **WASM/WASI support**: When used as a WASM/WASI module or as a library, `ffmpeg.exe` cannot be invoked — only the preprocessed method is available for video input.
 - **Improved HTML embedding**: HTML content is embedded using a pre-processing script that runs before the page is displayed, ensuring more reliable rendering.
 
 ## Installation
@@ -106,17 +106,18 @@ let result = build_polyglot(&config)?;
 std::fs::write("output.polyglot", &result.data)?;
 ```
 
+## Limitations
+
+- This project compiles and runs correctly. The Windows executable (`beheader.exe`) has been tested and is fully functional.
+- Other targets have not been tested, although they probably should work, including: executables for other platforms (Linux, macOS), usage as a library crate, and WASM/WASI builds. If there's a problem, you can open an issue or pull request.
+- Because of vibe coding, no guarantee for having not made any mistake.
+
 ## License
 
 GPL-3.0 — see [LICENSE](LICENSE) for details.
 
 This project is a port of [beheader](https://github.com/p2r3/beheader) by p2r3, originally licensed under GPL-3.0.
 
-## Limitations
-
-- This project compiles and runs correctly. The Windows executable (`beheader.exe`) has been tested and is fully functional.
-- All other targets have **not been tested**, including: executables for other platforms (Linux, macOS), usage as a library crate, and WASM/WASI builds. If you encounter issues, please [open an issue](https://github.com/rightester/beheader-rs/issues).
-
 ## Acknowledgments
 
-This project was built entirely using the Qwen 3.5 Plus model and [opencode](https://opencode.ai).
+This project was built entirely using the Qwen 3.6 Plus model with [opencode](https://opencode.ai).
