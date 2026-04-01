@@ -112,6 +112,11 @@ GPL-3.0 — see [LICENSE](LICENSE) for details.
 
 This project is a port of [beheader](https://github.com/p2r3/beheader) by p2r3, originally licensed under GPL-3.0.
 
+## Limitations
+
+- This project compiles and runs correctly. The Windows executable (`beheader.exe`) has been tested and is fully functional.
+- All other targets have **not been tested**, including: executables for other platforms (Linux, macOS), usage as a library crate, and WASM/WASI builds. If you encounter issues, please [open an issue](https://github.com/rightester/beheader-rs/issues).
+
 ## Acknowledgments
 
 This project was built entirely using the Qwen 3.5 Plus model and [opencode](https://opencode.ai).
