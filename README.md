@@ -8,7 +8,7 @@ A polyglot generator for media files — produce a single file that behaves as a
 
 ## Features
 
-- **Self-contained binary**: All external CLI tool logic has been integrated into the binary itself. No extra executable dependencies required, except `ffmpeg.exe` for video/audio encoding.
+- **Self-contained binary**: Most of the external CLI tools' logic has been integrated into the binary itself. No extra executable dependencies required, except `ffmpeg.exe` for video/audio encoding.
 - **Decoupled architecture**: Split into a `bin` target (the CLI executable) and a `lib` target (reusable library crate), allowing programmatic use of the polyglot generation logic.
 - **About ffmpeg executable**: The CLI tool will try to find and use ffmpeg on demand in opened-up environment like Desktop, for user's convenience.
 - **`--preprocessed-mp4`**: Accept a pre-encoded MP4 file as input, completely bypassing the need for `ffmpeg.exe` if needed.
@@ -17,12 +17,6 @@ A polyglot generator for media files — produce a single file that behaves as a
 - **Improved HTML embedding**: HTML content is embedded using a pre-processing script that runs before the page is displayed, ensuring more reliable rendering.
 
 ## Installation
-
-### From crates.io
-
-```bash
-cargo install beheader-rs
-```
 
 ### From source
 
@@ -88,7 +82,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-beheader-rs = "0.3"
+beheader-rs = { git = "https://github.com/rightester/beheader-rs.git" }
 ```
 
 ```rust
